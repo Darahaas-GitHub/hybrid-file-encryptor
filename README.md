@@ -57,7 +57,7 @@ When a file is encrypted, the utility prepends a custom structural layout header
 ### Installation
 Clone the repository locally and sync module dependencies:
 ```bash
-git clone [https://github.com/YOUR_GITHUB_USERNAME/hybrid-file-encryptor.git](https://github.com/YOUR_GITHUB_USERNAME/hybrid-file-encryptor.git)
+git clone [https://github.com/Darahaas-GitHub/hybrid-file-encryptor.git](https://github.com/Darahaas-GitHub/hybrid-file-encryptor.git)
 cd hybrid-file-encryptor
 go mod tidy
 Usage & CLI Command Routing
