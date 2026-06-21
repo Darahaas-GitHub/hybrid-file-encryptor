@@ -90,4 +90,8 @@ Go Extended Cryptography Suite (golang.org/x/crypto/mlkem, golang.org/x/crypto/h
 
 ---
 
+## 📄 License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
 README CREATED USING GOOGLE GEMINI
