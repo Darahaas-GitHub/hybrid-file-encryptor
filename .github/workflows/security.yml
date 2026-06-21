@@ -1,5 +1,9 @@
 name: Security Audit
+
 on: [push, pull_request]
+
+permissions:
+  contents: read
 
 jobs:
   scan:
@@ -11,7 +15,11 @@ jobs:
       - name: Setup Go Engine
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run Tests
+        run: go test ./...
 
       - name: Execute Govulncheck
         run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...

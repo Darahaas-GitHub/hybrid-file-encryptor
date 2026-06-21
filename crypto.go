@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 
 	"github.com/cloudflare/circl/kem"
 	"github.com/cloudflare/circl/kem/mlkem/mlkem768"
@@ -17,16 +18,23 @@ import (
 )
 
 const (
-	// magicHeader is prepended to encrypted files for format identification.
-	magicHeader = "HFPQV1"
+	// fileMagic is prepended to encrypted files for format identification.
+	fileMagic                           = "HPQENC"
+	fileVersion                         = byte(1)
+	fileSuiteHybridX25519MLKEM768AESGCM = byte(1)
 	// chunkSize is the plaintext chunk size for streaming encryption (64 KB).
 	chunkSize = 64 * 1024
 	// x25519CtLen is the byte length of an X25519 ephemeral public key.
 	x25519CtLen = 32
-	// mlkemCtLen is the byte length of an ML-KEM-768 ciphertext.
-	mlkemCtLen = 1088
 	// nonceLen is the byte length of an AES-GCM nonce.
 	nonceLen = 12
+	// maxEncryptedChunkLen limits allocation from untrusted ciphertext lengths.
+	maxEncryptedChunkLen = chunkSize + 16
+)
+
+const (
+	chunkAADContinuation = "cont"
+	chunkAADFinal        = "last"
 )
 
 // HybridKeyPair holds both classical and post-quantum public/private keys.
@@ -66,7 +74,7 @@ func CombineSecrets(x25519Secret, mlkemSecret []byte) ([]byte, error) {
 	ikm = append(ikm, x25519Secret...)
 	ikm = append(ikm, mlkemSecret...)
 
-	info := []byte("hybrid-pqc-file-encryptor-v1")
+	info := []byte("HPQENC-v1-X25519-MLKEM768-AES256GCM")
 	reader := hkdf.New(sha256.New, ikm, nil, info)
 
 	key := make([]byte, 32)
@@ -74,6 +82,96 @@ func CombineSecrets(x25519Secret, mlkemSecret []byte) ([]byte, error) {
 		return nil, fmt.Errorf("HKDF key derivation failed: %w", err)
 	}
 	return key, nil
+}
+
+func buildFileHeader(ctX25519, ctMLKEM, baseNonce []byte) ([]byte, error) {
+	if len(ctX25519) != x25519CtLen {
+		return nil, fmt.Errorf("invalid X25519 ciphertext length: got %d, want %d", len(ctX25519), x25519CtLen)
+	}
+	if len(ctMLKEM) != mlkem768.Scheme().CiphertextSize() {
+		return nil, fmt.Errorf("invalid ML-KEM ciphertext length: got %d, want %d", len(ctMLKEM), mlkem768.Scheme().CiphertextSize())
+	}
+	if len(baseNonce) != nonceLen {
+		return nil, fmt.Errorf("invalid nonce length: got %d, want %d", len(baseNonce), nonceLen)
+	}
+	if len(ctX25519) > math.MaxUint16 || len(ctMLKEM) > math.MaxUint16 {
+		return nil, fmt.Errorf("ciphertext component too large")
+	}
+
+	header := make([]byte, 0, len(fileMagic)+1+1+4+2+2+1+len(ctX25519)+len(ctMLKEM)+len(baseNonce))
+	header = append(header, []byte(fileMagic)...)
+	header = append(header, fileVersion, fileSuiteHybridX25519MLKEM768AESGCM)
+	header = binary.BigEndian.AppendUint32(header, chunkSize)
+	header = binary.BigEndian.AppendUint16(header, uint16(len(ctX25519)))
+	header = binary.BigEndian.AppendUint16(header, uint16(len(ctMLKEM)))
+	header = append(header, byte(len(baseNonce)))
+	header = append(header, ctX25519...)
+	header = append(header, ctMLKEM...)
+	header = append(header, baseNonce...)
+	return header, nil
+}
+
+func readFileHeader(r io.Reader) (header, ctX25519, ctMLKEM, baseNonce []byte, err error) {
+	prefixLen := len(fileMagic) + 1 + 1 + 4 + 2 + 2 + 1
+	prefix := make([]byte, prefixLen)
+	if _, err := io.ReadFull(r, prefix); err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("invalid file: missing or truncated header")
+	}
+	if string(prefix[:len(fileMagic)]) != fileMagic {
+		return nil, nil, nil, nil, fmt.Errorf("invalid file: missing or incorrect magic header")
+	}
+
+	offset := len(fileMagic)
+	version := prefix[offset]
+	offset++
+	if version != fileVersion {
+		return nil, nil, nil, nil, fmt.Errorf("unsupported encrypted file version: %d", version)
+	}
+	suite := prefix[offset]
+	offset++
+	if suite != fileSuiteHybridX25519MLKEM768AESGCM {
+		return nil, nil, nil, nil, fmt.Errorf("unsupported cryptographic suite: %d", suite)
+	}
+	encodedChunkSize := binary.BigEndian.Uint32(prefix[offset:])
+	offset += 4
+	if encodedChunkSize != chunkSize {
+		return nil, nil, nil, nil, fmt.Errorf("unsupported chunk size: %d", encodedChunkSize)
+	}
+	xLen := int(binary.BigEndian.Uint16(prefix[offset:]))
+	offset += 2
+	mlkemLen := int(binary.BigEndian.Uint16(prefix[offset:]))
+	offset += 2
+	nLen := int(prefix[offset])
+
+	if xLen != x25519CtLen {
+		return nil, nil, nil, nil, fmt.Errorf("invalid X25519 ciphertext length: %d", xLen)
+	}
+	if mlkemLen != mlkem768.Scheme().CiphertextSize() {
+		return nil, nil, nil, nil, fmt.Errorf("invalid ML-KEM ciphertext length: %d", mlkemLen)
+	}
+	if nLen != nonceLen {
+		return nil, nil, nil, nil, fmt.Errorf("invalid nonce length: %d", nLen)
+	}
+
+	components := make([]byte, xLen+mlkemLen+nLen)
+	if _, err := io.ReadFull(r, components); err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("failed to read encrypted file header components: %w", err)
+	}
+
+	header = make([]byte, 0, len(prefix)+len(components))
+	header = append(header, prefix...)
+	header = append(header, components...)
+	ctX25519 = components[:xLen]
+	ctMLKEM = components[xLen : xLen+mlkemLen]
+	baseNonce = components[xLen+mlkemLen:]
+	return header, ctX25519, ctMLKEM, baseNonce, nil
+}
+
+func chunkAAD(header []byte, role string) []byte {
+	aad := make([]byte, 0, len(header)+len(role))
+	aad = append(aad, header...)
+	aad = append(aad, role...)
+	return aad
 }
 
 // Encapsulate performs hybrid key encapsulation against the recipient's public
@@ -146,13 +244,17 @@ func deriveChunkNonce(baseNonce []byte, counter uint64) []byte {
 //
 // Output format:
 //
-//	"HFPQV1"   (6 bytes magic header)
-//	ctX25519   (32 bytes, ephemeral X25519 public key)
-//	ctMLKEM    (1088 bytes, ML-KEM-768 ciphertext)
-//	baseNonce  (12 bytes, random)
+//	"HPQENC"   (6 bytes magic header)
+//	version    (1 byte)
+//	suite      (1 byte)
+//	chunkSize  (4 bytes)
+//	lengths    (X25519, ML-KEM, nonce)
+//	ctX25519   (ephemeral X25519 public key)
+//	ctMLKEM    (ML-KEM-768 ciphertext)
+//	baseNonce  (random)
 //	[chunks...]:
 //	  [uint32 BE chunk_ciphertext_len][chunk_ciphertext + GCM tag]
-//	  AAD = "cont" for non-final chunks, "last" for the final chunk
+//	  AAD = header || "cont" for non-final chunks, header || "last" for final
 func EncryptData(recipientMLKEMPub kem.PublicKey, recipientX25519Pub *ecdh.PublicKey, r io.Reader, w io.Writer) error {
 	// 1. Encapsulate to derive hybrid shared secret
 	ctX25519, ctMLKEM, combinedSecret, err := Encapsulate(recipientX25519Pub, recipientMLKEMPub)
@@ -176,13 +278,13 @@ func EncryptData(recipientMLKEMPub kem.PublicKey, recipientX25519Pub *ecdh.Publi
 		return fmt.Errorf("failed to generate random nonce: %w", err)
 	}
 
-	// 4. Write header: magic || ctX25519 || ctMLKEM || baseNonce
-	for _, segment := range [][]byte{
-		[]byte(magicHeader), ctX25519, ctMLKEM, baseNonce,
-	} {
-		if _, err := w.Write(segment); err != nil {
-			return fmt.Errorf("failed to write header: %w", err)
-		}
+	// 4. Write authenticated, versioned header.
+	header, err := buildFileHeader(ctX25519, ctMLKEM, baseNonce)
+	if err != nil {
+		return fmt.Errorf("failed to build encrypted file header: %w", err)
+	}
+	if _, err := w.Write(header); err != nil {
+		return fmt.Errorf("failed to write header: %w", err)
 	}
 
 	// 5. Stream plaintext in 64 KB chunks
@@ -198,13 +300,13 @@ func EncryptData(recipientMLKEMPub kem.PublicKey, recipientX25519Pub *ecdh.Publi
 
 		isLast := readErr == io.EOF || readErr == io.ErrUnexpectedEOF
 
-		aad := []byte("cont")
+		aadRole := chunkAADContinuation
 		if isLast {
-			aad = []byte("last")
+			aadRole = chunkAADFinal
 		}
 
 		chunkNonce := deriveChunkNonce(baseNonce, counter)
-		sealed := gcm.Seal(nil, chunkNonce, buf[:n], aad)
+		sealed := gcm.Seal(nil, chunkNonce, buf[:n], chunkAAD(header, aadRole))
 
 		binary.BigEndian.PutUint32(lenBuf[:], uint32(len(sealed)))
 		if _, err := w.Write(lenBuf[:]); err != nil {
@@ -226,36 +328,19 @@ func EncryptData(recipientMLKEMPub kem.PublicKey, recipientX25519Pub *ecdh.Publi
 // DecryptData decrypts data from r and writes the plaintext to w using the
 // recipient's private keys.
 func DecryptData(recipientX25519Priv *ecdh.PrivateKey, recipientMLKEMPriv kem.PrivateKey, r io.Reader, w io.Writer) error {
-	// 1. Read and verify magic header
-	magic := make([]byte, len(magicHeader))
-	if _, err := io.ReadFull(r, magic); err != nil {
-		return fmt.Errorf("invalid file: missing or incorrect magic header")
-	}
-	if string(magic) != magicHeader {
-		return fmt.Errorf("invalid file: missing or incorrect magic header")
+	// 1. Read and verify encrypted file header.
+	header, ctX25519, ctMLKEM, baseNonce, err := readFileHeader(r)
+	if err != nil {
+		return err
 	}
 
-	// 2. Read key exchange ciphertexts and base nonce
-	ctX25519 := make([]byte, x25519CtLen)
-	if _, err := io.ReadFull(r, ctX25519); err != nil {
-		return fmt.Errorf("failed to read X25519 ciphertext: %w", err)
-	}
-	ctMLKEM := make([]byte, mlkemCtLen)
-	if _, err := io.ReadFull(r, ctMLKEM); err != nil {
-		return fmt.Errorf("failed to read ML-KEM ciphertext: %w", err)
-	}
-	baseNonce := make([]byte, nonceLen)
-	if _, err := io.ReadFull(r, baseNonce); err != nil {
-		return fmt.Errorf("failed to read base nonce: %w", err)
-	}
-
-	// 3. Decapsulate to recover combined secret
+	// 2. Decapsulate to recover combined secret.
 	combinedSecret, err := Decapsulate(recipientX25519Priv, recipientMLKEMPriv, ctX25519, ctMLKEM)
 	if err != nil {
 		return fmt.Errorf("failed to decapsulate shared secret: %w", err)
 	}
 
-	// 4. Set up AES-256-GCM
+	// 3. Set up AES-256-GCM.
 	block, err := aes.NewCipher(combinedSecret)
 	if err != nil {
 		return fmt.Errorf("failed to create AES cipher: %w", err)
@@ -265,7 +350,7 @@ func DecryptData(recipientX25519Priv *ecdh.PrivateKey, recipientMLKEMPriv kem.Pr
 		return fmt.Errorf("failed to create GCM: %w", err)
 	}
 
-	// 5. Decrypt chunks
+	// 4. Decrypt chunks.
 	var counter uint64
 	var lenBuf [4]byte
 
@@ -279,6 +364,9 @@ func DecryptData(recipientX25519Priv *ecdh.PrivateKey, recipientMLKEMPriv kem.Pr
 		}
 
 		chunkLen := binary.BigEndian.Uint32(lenBuf[:])
+		if chunkLen == 0 || chunkLen > maxEncryptedChunkLen {
+			return fmt.Errorf("invalid encrypted chunk length: %d", chunkLen)
+		}
 		chunkData := make([]byte, chunkLen)
 		if _, err := io.ReadFull(r, chunkData); err != nil {
 			return fmt.Errorf("failed to read chunk data: %w", err)
@@ -286,11 +374,11 @@ func DecryptData(recipientX25519Priv *ecdh.PrivateKey, recipientMLKEMPriv kem.Pr
 
 		chunkNonce := deriveChunkNonce(baseNonce, counter)
 
-		// Try decrypting as a continuation chunk first
-		plaintext, err := gcm.Open(nil, chunkNonce, chunkData, []byte("cont"))
+		// Try decrypting as a continuation chunk first.
+		plaintext, err := gcm.Open(nil, chunkNonce, chunkData, chunkAAD(header, chunkAADContinuation))
 		if err != nil {
-			// Try as the final chunk
-			plaintext, err = gcm.Open(nil, chunkNonce, chunkData, []byte("last"))
+			// Try as the final chunk.
+			plaintext, err = gcm.Open(nil, chunkNonce, chunkData, chunkAAD(header, chunkAADFinal))
 			if err != nil {
 				return fmt.Errorf("failed to decrypt chunk %d: authentication failed", counter)
 			}
