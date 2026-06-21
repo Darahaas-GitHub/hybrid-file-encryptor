@@ -5,7 +5,7 @@
 
 version: 2
 updates:
-  - package-ecosystem: "go" # See documentation for possible values
+  - package-ecosystem: "gomod" # Use gomod for Go modules
     directory: "/" # Location of package manifests
     schedule:
       interval: "weekly"
