@@ -1,4 +1,4 @@
-# Hybrid Post-Quantum File Encryptor
+# Hybrid Post-Quantum File Encryptor (Demo Project)
 
 A Go command-line tool for streaming file encryption with a hybrid classical and post-quantum envelope:
 
