@@ -1,111 +1,134 @@
-# hybrid-file-encryptor
+# Hybrid Post-Quantum File Encryptor (Go)
 
-A command-line tool for hybrid post-quantum file encryption. It combines X25519 (classical elliptic-curve Diffie–Hellman) with ML-KEM-768 (NIST's post-quantum key encapsulation mechanism) so that an attacker must break *both* schemes to recover the plaintext. The threat model is simple: a sender encrypts a file to a recipient's public key, and only the holder of the corresponding private key can decrypt it. This protects data at rest against a future adversary with a cryptographically relevant quantum computer, while retaining classical security today.
+A high-performance command-line utility built in Go that protects data-at-rest using a **Hybrid Cryptographic Architecture**. By fusing battle-tested classical elliptic curve cryptography with NIST-standardized Post-Quantum Cryptography (PQC), this tool ensures your protected files remain completely secure against both traditional attacks and future quantum computing capabilities ("Harvest Now, Decrypt Later").
+
+---
 
 ## Cryptographic Architecture
 
-1. **Key Generation**: The recipient generates an X25519 keypair and an ML-KEM-768 keypair. Both public keys are stored together in `id_hybrid.pub`; both private keys in `id_hybrid`.
+This utility employs an asymmetric envelope encryption strategy. Instead of utilizing a pre-shared password, it encrypts data for a recipient's specific public cryptographic profile using a layered "Dual-Lock" mechanism. An adversary must mathematically compromise *both* X25519 and ML-KEM-768 simultaneously to read the underlying data.
 
-2. **Encryption** (performed by the sender):
-   - An ephemeral X25519 keypair is generated. The sender performs ECDH with the recipient's X25519 public key to derive a classical shared secret.
-   - ML-KEM-768 encapsulation produces a post-quantum shared secret and a ciphertext.
-   - The two shared secrets are concatenated and fed into **HKDF-SHA256** (no salt, info string `hybrid-pqc-file-encryptor-v1`) to derive a single 32-byte AES-256 key.
-   - The file is encrypted in 64 KB streaming chunks using **AES-256-GCM**. Each chunk gets a unique nonce derived by XOR-ing a random 12-byte base nonce with a zero-padded big-endian uint64 chunk counter. Each chunk's GCM additional authenticated data (AAD) is `"cont"` for non-final chunks and `"last"` for the final chunk, which prevents silent truncation.
+### Phase 1: Encryption Flow
 
-3. **Decryption** (performed by the recipient):
-   - The recipient reads the magic header and key-exchange ciphertexts from the file header.
-   - X25519 ECDH and ML-KEM decapsulation recover the two shared secrets; HKDF derives the same AES key.
-   - Chunks are decrypted in sequence. The AAD is verified to detect truncation or reordering.
+This phase starts with plaintext and the recipient's public keys, producing a combined ciphertext payload. The main entry point is `EncryptData`.
 
-## Encrypted File Format (`.enc`)
+1. **Key Encapsulation:** `EncryptData` handles key encapsulation to generate the hybrid shared secret and key encapsulation components.
 
-```
-Offset  Length   Field
-──────  ──────   ─────
-0       6        Magic header: ASCII "HFPQV1"
-6       32       Ephemeral X25519 public key (ctX25519)
-38      1088     ML-KEM-768 ciphertext (ctMLKEM)
-1126    12       Base nonce (random)
-1138    ...      Chunked ciphertext stream
-```
+   * **Classical KEM (X25519):** An ephemeral X25519 key pair is generated. The ephemeral public key becomes the ciphertext component `ctX25519`. An ECDH operation is performed with the recipient's public key to establish a classical secret (`x25519Secret`).
+   * **Post-Quantum KEM (ML-KEM-768):** The ML-KEM scheme encapsulates a secret against the recipient's ML-KEM public key, producing `ctMLKEM` and a post-quantum secret (`mlkemSecret`).
 
-Each chunk in the stream:
+2. **Deriving the Shared Secret:** Both secrets are passed to `DeriveAESKey` (which utilizes HKDF-SHA256 internally) to safely mix and smooth the entropy from both classical and post-quantum methods into a single `combinedSecret`.
 
-```
-[uint32 BE: length of sealed_data][sealed_data]
-```
+3. **Symmetric Encryption:** Back in `EncryptData`, the `combinedSecret` is used to initialize an AES-GCM cipher block.
 
-`sealed_data` = AES-GCM ciphertext + 16-byte authentication tag. AAD is `"cont"` or `"last"`.
+   * A random 12-byte initialization vector (nonce) is generated.
+   * The plaintext is encrypted using AES-GCM to produce the `encryptedPayload`.
 
-## Key File Format
+4. **Assembly:** The final output byte array is packed in this sequence:
 
-Both `id_hybrid` (private) and `id_hybrid.pub` (public) use the same container format:
+$$
+\text{Output} = \text{ctX25519 (32 bytes)} \parallel \text{ctMLKEM (1088 bytes)} \parallel \text{nonce (12 bytes)} \parallel \text{encryptedPayload}
+$$
 
-```
-[6 bytes: "HFPQV1"]
-[uint16 BE: key1_length][key1_bytes]
-[uint16 BE: key2_length][key2_bytes]
-```
+---
 
-- **Public file** (`id_hybrid.pub`): key1 = X25519 public key (32 bytes), key2 = ML-KEM-768 public key.
-- **Private file** (`id_hybrid`): key1 = X25519 private key (32 bytes), key2 = ML-KEM-768 private key.
+### Phase 2: Decryption Flow
 
-## CLI Usage
+This phase takes the packed ciphertext and the recipient's private keys, recovering the original plaintext. The entry point is `DecryptData`.
 
-### Generate a keypair
+1. **Unpacking the Payload:** `DecryptData` slices the input ciphertext to separate the components:
 
-```
-hybrid-encryptor gen-keys
-```
+   * `ctX25519` (first 32 bytes)
+   * `ctMLKEM` (next 1088 bytes)
+   * `nonce` (next 12 bytes)
+   * `encryptedPayload` (the remaining bytes)
 
-Writes `id_hybrid` (private, mode 0600) and `id_hybrid.pub` (public, mode 0644) in the current directory.
+2. **Key Decapsulation:** `DecryptData` handles decapsulation with the recipient's private keys and the extracted ciphertext KEM components.
 
-### Encrypt a file
+   * **Classical KEM (X25519):** Computes the shared classical secret using the recipient's X25519 private key and the ephemeral public key `ctX25519`.
+   * **Post-Quantum KEM (ML-KEM-768):** Decapsulates `ctMLKEM` using the recipient's ML-KEM private key to recover the post-quantum secret.
 
-```
-hybrid-encryptor encrypt -file document.txt -pubkey id_hybrid.pub
+3. **Re-deriving the Shared Secret:** Like encryption, it calls the key derivation logic to hash both recovered secrets together with SHA-256 to reconstruct the exact same `combinedSecret`.
+
+4. **Symmetric Decryption:** Using the recovered `combinedSecret`, `DecryptData` initializes the AES-GCM cipher block. It decrypts and verifies the integrity of the `encryptedPayload` using the `nonce` via `gcm.Open`. If the authentication check succeeds, the original plaintext is returned.
+
+---
+
+## Binary File Format Specification
+
+When a file is encrypted, the utility prepends a custom structural layout header containing the public deployment configuration keys to the payload. This adds a minimal overhead of only ~1.1 KB to the file size:
+
+```text
+┌─────────────────────────┬─────────────────────────┬───────────────────┬────────────────────────┐
+│  X25519 Ephemeral Pub   │   ML-KEM Ciphertext     │  AES-GCM Nonce    │ Encrypted File Data    │
+│       (32 Bytes)        │      (1088 Bytes)       │    (12 Bytes)     │ (Variable Size)        │
+└─────────────────────────┴─────────────────────────┴───────────────────┴────────────────────────┘
 ```
 
-Produces `document.txt.enc` (mode 0600). The private key is never touched during encryption.
+---
 
-### Decrypt a file
+## Getting Started
 
-```
-hybrid-encryptor decrypt -file document.txt.enc -privkey id_hybrid
-```
+### Prerequisites
 
-Produces `document.txt` (the `.enc` suffix is stripped). If the input doesn't end in `.enc`, the output gets a `.dec` suffix.
+* Go compiler toolchain (**v1.21** or higher)
 
-## Limitations & Known Gaps
+### Installation
 
-- **Memory per chunk**: Each 64 KB chunk is fully buffered in memory during encryption and decryption. The tool streams across chunks, but individual chunks are not sub-streamed. This is adequate for normal file sizes but is not a true constant-memory streaming cipher.
-- **No key revocation**: There is no mechanism to revoke a compromised keypair. If your private key leaks, all files encrypted to it are compromised.
-- **No authenticated sender identity**: The encryption is anonymous. The recipient cannot verify *who* encrypted the file — only that someone with their public key did.
-- **No cross-platform key portability guarantees**: The key file format is a simple binary encoding. Byte-order is fixed (big-endian), but no versioning beyond the magic header exists. Future format changes would need a new magic string or version byte.
-- **No key derivation from passwords**: Keys are raw cryptographic keys, not derived from passphrases. There is no KDF-based key wrapping for the private key file.
-- **Chunk counter overflow**: The nonce derivation uses a uint64 counter. At 64 KB per chunk, this overflows after 2^64 chunks (~10^20 bytes), which is not a practical concern.
-
-## Build & Test
-
-Requires Go 1.21+ (tested with Go 1.26).
+Clone the repository locally and sync module dependencies:
 
 ```bash
-# Build
-go build -o hybrid-encryptor .
-
-# Run tests
-go test -v -count=1 ./...
-
-# Quick smoke test
-./hybrid-encryptor gen-keys
-echo "hello world" > test.txt
-./hybrid-encryptor encrypt -file test.txt -pubkey id_hybrid.pub
-./hybrid-encryptor decrypt -file test.txt.enc -privkey id_hybrid
-cat test.txt  # should print "hello world"
+git clone https://github.com/Darahaas-GitHub/hybrid-file-encryptor.git
+cd hybrid-file-encryptor
+go mod tidy
 ```
 
-## Dependencies
+## Usage & CLI Command Routing
 
-- [cloudflare/circl](https://github.com/cloudflare/circl) — ML-KEM-768 implementation
-- [golang.org/x/crypto](https://pkg.go.dev/golang.org/x/crypto) — HKDF-SHA256
-- Go standard library — AES-GCM, X25519, SHA-256
+The application exposes three primary subcommand routers within the terminal flags interface.
+
+### 1. Key Generation
+
+Generate a fresh, persistent hybrid identity key pair for testing or distribution:
+
+```bash
+go run . gen-keys
+```
+
+### 2. Encrypting a File
+
+To encrypt a targeted local file, call the encrypt subcommand. The application will output an encrypted `.enc` asset payload file, alongside a companion demo `.key` asset tracking private vectors:
+
+```bash
+go run . encrypt -file message.txt
+```
+
+Output:
+
+```text
+message.txt.enc
+message.txt.key
+```
+
+### 3. Decrypting a File
+
+To unlock the encrypted container back into clean plaintext file formats, execute the decrypt path flag routing command:
+
+```bash
+go run . decrypt -file message.txt.enc
+```
+
+The program automatically locates the associated `.key` module, decapsulates the multi-layered hybrid shared secrets, executes structural tamper-checks, and writes the recovered output.
+
+## Built Using
+
+* Go Standard Library (`crypto/aes`, `crypto/cipher`, `crypto/ecdh`)
+* Go Extended Cryptography Suite (`golang.org/x/crypto/mlkem`, `golang.org/x/crypto/hkdf`)
+
+---
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+README created using Google Gemini and OpenAI ChatGPT.
