@@ -39,7 +39,7 @@ go mod download
 
 ## Usage
 
-Generate a recipient key pair:
+Generate a recipient key pair without a passphrase:
 
 ```bash
 go run . gen-keys -out-dir . -name id_hybrid
