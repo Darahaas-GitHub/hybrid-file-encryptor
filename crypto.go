@@ -256,13 +256,12 @@ func deriveChunkNonce(baseNonce []byte, counter uint64) []byte {
 //	  [uint32 BE chunk_ciphertext_len][chunk_ciphertext + GCM tag]
 //	  AAD = header || "cont" for non-final chunks, header || "last" for final
 func EncryptData(recipientMLKEMPub kem.PublicKey, recipientX25519Pub *ecdh.PublicKey, r io.Reader, w io.Writer) error {
-	// 1. Encapsulate to derive hybrid shared secret
+	// Encapsulate to derive hybrid shared secret
 	ctX25519, ctMLKEM, combinedSecret, err := Encapsulate(recipientX25519Pub, recipientMLKEMPub)
 	if err != nil {
 		return fmt.Errorf("failed to encapsulate secrets: %w", err)
 	}
-
-	// 2. Set up AES-256-GCM
+	// Set up AES-256-GCM
 	block, err := aes.NewCipher(combinedSecret)
 	if err != nil {
 		return fmt.Errorf("failed to create AES cipher: %w", err)
@@ -272,13 +271,13 @@ func EncryptData(recipientMLKEMPub kem.PublicKey, recipientX25519Pub *ecdh.Publi
 		return fmt.Errorf("failed to create GCM: %w", err)
 	}
 
-	// 3. Generate base nonce (12 random bytes)
+	// Generate base nonce (12 random bytes)
 	baseNonce := make([]byte, nonceLen)
 	if _, err := rand.Read(baseNonce); err != nil {
 		return fmt.Errorf("failed to generate random nonce: %w", err)
 	}
 
-	// 4. Write authenticated, versioned header.
+	//Write authenticated, versioned header.
 	header, err := buildFileHeader(ctX25519, ctMLKEM, baseNonce)
 	if err != nil {
 		return fmt.Errorf("failed to build encrypted file header: %w", err)
@@ -287,7 +286,7 @@ func EncryptData(recipientMLKEMPub kem.PublicKey, recipientX25519Pub *ecdh.Publi
 		return fmt.Errorf("failed to write header: %w", err)
 	}
 
-	// 5. Stream plaintext in 64 KB chunks
+	//                                  Stream plaintext in 64 KB chunks
 	buf := make([]byte, chunkSize)
 	var counter uint64
 	var lenBuf [4]byte
@@ -325,22 +324,21 @@ func EncryptData(recipientMLKEMPub kem.PublicKey, recipientX25519Pub *ecdh.Publi
 	return nil
 }
 
-// DecryptData decrypts data from r and writes the plaintext to w using the
-// recipient's private keys.
+// DecryptData decrypts data from r and writes the plaintext to w using the recipient's private keys.
 func DecryptData(recipientX25519Priv *ecdh.PrivateKey, recipientMLKEMPriv kem.PrivateKey, r io.Reader, w io.Writer) error {
-	// 1. Read and verify encrypted file header.
+	// Read and verify encrypted file header.
 	header, ctX25519, ctMLKEM, baseNonce, err := readFileHeader(r)
 	if err != nil {
 		return err
 	}
 
-	// 2. Decapsulate to recover combined secret.
+	//Decapsulate to recover combined secret.
 	combinedSecret, err := Decapsulate(recipientX25519Priv, recipientMLKEMPriv, ctX25519, ctMLKEM)
 	if err != nil {
 		return fmt.Errorf("failed to decapsulate shared secret: %w", err)
 	}
 
-	// 3. Set up AES-256-GCM.
+	//Set up AES-256-GCM.
 	block, err := aes.NewCipher(combinedSecret)
 	if err != nil {
 		return fmt.Errorf("failed to create AES cipher: %w", err)
@@ -350,7 +348,7 @@ func DecryptData(recipientX25519Priv *ecdh.PrivateKey, recipientMLKEMPriv kem.Pr
 		return fmt.Errorf("failed to create GCM: %w", err)
 	}
 
-	// 4. Decrypt chunks.
+	//Decrypt chunks.
 	var counter uint64
 	var lenBuf [4]byte
 
@@ -388,7 +386,7 @@ func DecryptData(recipientX25519Priv *ecdh.PrivateKey, recipientMLKEMPriv kem.Pr
 					return fmt.Errorf("failed to write plaintext: %w", err)
 				}
 			}
-			// Check that nothing follows the final chunk
+			// Check - nothing follows the final chunk
 			trailing := make([]byte, 1)
 			n, _ := r.Read(trailing)
 			if n > 0 {
