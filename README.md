@@ -97,6 +97,10 @@ go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
 The GitHub Actions workflow runs tests and `govulncheck` on push and pull request.
 
+## Future Updates List
+
+Addition of hashing to files.
+
 ## Repository Hygiene
 
 The `.gitignore` excludes generated keys, encrypted outputs, decrypted outputs, `.env` files, and local binaries. Do not commit private keys, passphrases, decrypted files, or generated executables.
